@@ -600,7 +600,11 @@ not filled, so publishing would cache empty KV; the request re-prefills
 the same way. Mixed partners in that forward retract together so ranks
 stay aligned, and a D-role `plan.remote_prefill` admission retracts with
 them — the peer pull is withheld so suffix-only KV cannot land on empty
-prefix pages. The client is not failed. There is no queue to keep in
+prefix pages. On D that admission re-prefills the same way too, so it goes
+back to the peer as a remote admission. A D-role local recovery whose
+prefetch missed has output and the peer already prefilled it, so it
+readmits through local recovery, like a capacity victim on D. The client
+is not failed. There is no queue to keep in
 step with the FSM: a request that finishes or aborts while retracted
 simply stops qualifying, with no bookkeeping to prune.
 Nor is bounded replay (§1.3) carried across a

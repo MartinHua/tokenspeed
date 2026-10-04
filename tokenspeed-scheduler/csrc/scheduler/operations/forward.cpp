@@ -308,7 +308,9 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
     AdmissionMatch match = matchPrefixAtAdmission(request);
-    const fsm::PrefillSource source = config_.role == Role::kD && request->Is<fsm::Submitted>()
+    // On D, a new prompt -- including a snapshot-less retraction, which
+    // re-prefills from scratch -- is prefilled by the peer.
+    const fsm::PrefillSource source = config_.role == Role::kD && admitsLikeNewPrompt(*request)
                                           ? fsm::PrefillSource::kRemote
                                           : fsm::PrefillSource::kLocal;
     const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();

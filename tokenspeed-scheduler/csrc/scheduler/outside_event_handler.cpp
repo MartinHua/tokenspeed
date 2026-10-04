@@ -165,8 +165,11 @@ void Scheduler::handleEvent(const forward::Retract& event) {
         return;
     }
     // Snapshot-less: dest pages were not filled. Publishing would cache empty
-    // KV. The request re-prefills through ordinary admission.
-    request->Apply(fsm::RetractEvent{&coordinator_, next_retraction_epoch_++, /*has_recoverable_snapshot=*/false,
+    // KV. The request re-prefills through ordinary admission -- except on D
+    // once it has output: the peer already prefilled it, so it recovers
+    // locally like a capacity victim (retractVictim).
+    const bool recovers_as_readmission = config_.role == Role::kD && request->HasGeneratedOutput();
+    request->Apply(fsm::RetractEvent{&coordinator_, next_retraction_epoch_++, recovers_as_readmission,
                                      request->HasGeneratedOutput()});
 }
 

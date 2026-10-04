@@ -288,6 +288,33 @@ TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemote
     EXPECT_EQ(decode->block_tables.at("full")[static_cast<std::size_t>(r0)].size(), 3u);
 }
 
+// The runtime retracts a remote admission whose L3 prefetch missed and
+// withholds the peer pull. The next admission must go back to the peer: a
+// local prefill window on the remote stream would decode without KV.
+TEST_F(DisaggDecodeAdmissionTestSuite, RetractedRemoteAdmissionReadmitsRemotely) {
+    Submit({MakeRequestSpec("r0", /*num_pages=*/1, /*start=*/1)});
+    SendBootstrapped("r0");
+    ASSERT_NE(FindRemoteAdmission(PlanOnce()), nullptr);
+
+    SendRetractEvent("r0");
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+
+    const ExecutionPlan readmission = PlanOnce();
+    ASSERT_EQ(FindRequestIndex(FindRemoteAdmission(readmission), "r0"), 0);
+    EXPECT_TRUE(scheduler_->PdTransferPinned("r0")) << "the readmission must wait for the peer again";
+
+    const ExecutionPlan waiting = PlanOnce();
+    EXPECT_LT(FindRequestIndex(FindForwardBatch(waiting.Operations()), "r0"), 0)
+        << "nothing may decode before the peer's KV lands";
+
+    SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
+    const ExecutionPlan decode_plan = PlanOnce();
+    const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
+    const std::int32_t r0 = FindRequestIndex(decode, "r0");
+    ASSERT_GE(r0, 0);
+    EXPECT_EQ(decode->decode_input_ids[static_cast<std::size_t>(r0)], 42);
+}
+
 class DisaggDecodePriorityTestSuite : public DisaggDecodeAdmissionTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -548,6 +575,58 @@ TEST_F(DecodeRetractionNoPrefixCacheTestSuite, RecoveryLoadsItsRetractionSnapsho
     const ExecutionPlan recovery = PlanOnce();
     EXPECT_FALSE(ExtractCacheOpsOfKind<LoadBackBatch>(recovery).empty())
         << "disabling ordinary prefix caching must not hide a request's own retraction snapshot";
+}
+
+// A local recovery whose L3 prefetch missed is retracted by the runtime.
+// The peer already finished this prompt, so the request must recover
+// locally again instead of being handed back to the peer.
+TEST_F(DecodeRetractionL2TestSuite, RetractedLocalRecoveryStaysLocal) {
+    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
+    SendBootstrapped("running");
+    PlanOnce();
+    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
+    PlanOnce();
+    SendForwardDone("running", {43});
+
+    Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/101)});
+    SendBootstrapped("blocked");
+    ExecutionPlan retract;
+    std::vector<CacheOperation> write_back_ops;
+    for (std::int32_t token = 44; token < 48 && write_back_ops.empty(); ++token) {
+        retract = PlanOnce();
+        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(retract);
+        const ForwardBatch* forward = FindForwardBatch(retract.Operations());
+        if (write_back_ops.empty() && forward != nullptr && !forward->request_ids.empty()) {
+            SendForwardDone("running", {token});
+        }
+    }
+    ASSERT_EQ(write_back_ops.size(), 1u);
+    SendWriteBackDone(std::get<WriteBackBatch>(write_back_ops.front()).op_ids.front());
+    SendRemotePrefillDone("blocked", /*bootstrap_token=*/142);
+    SendAbortEvent("blocked");
+
+    const ExecutionPlan recovery = PlanOnce();
+    ASSERT_EQ(FindRequestIndex(FindForwardBatch(recovery.Operations()), "running"), 0);
+    const auto load_ops = ExtractCacheOpsOfKind<LoadBackBatch>(recovery);
+    ASSERT_EQ(load_ops.size(), 1u);
+
+    SendRetractEvent("running");
+    for (const std::uint32_t op_id : std::get<LoadBackBatch>(load_ops.front()).op_ids) {
+        SendLoadBackDone(op_id, /*success=*/false);
+    }
+
+    for (int round = 0; round < 4; ++round) {
+        const ExecutionPlan retry = PlanOnce();
+        ASSERT_LT(FindRequestIndex(FindRemoteAdmission(retry), "running"), 0)
+            << "the peer already prefilled this prompt";
+        const ForwardBatch* local = FindForwardBatch(retry.Operations());
+        if (FindRequestIndex(local, "running") == 0) {
+            EXPECT_GT(local->input_lengths.front(), 0) << "the request must re-run local recovery";
+            EXPECT_FALSE(scheduler_->PdTransferPinned("running"));
+            return;
+        }
+    }
+    FAIL() << "the retracted recovery was never readmitted";
 }
 
 TEST_F(DecodeRetractionL2TestSuite, RemotePrefillInFlightStallsAdditionalAdmission) {
